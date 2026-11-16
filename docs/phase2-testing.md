@@ -1,10 +1,12 @@
 # Phase 2/3 software — what exists and how to prove it on hardware
 
 Everything here was written before any hardware was available. Verified so far:
-all firmwares compile, and the pure logic passes 40 unit tests on the PC
+all firmwares compile, and the pure logic passes 58 unit tests on the PC
 (`pio test -e native`): frame codec, message codecs, command authentication,
-irrigation core, scheduler. **Nothing has run on an ESP32 yet**, and the gateway,
-MQTT path and docker stack have never been run end to end.
+irrigation core, scheduler, clock maths, data log. The server side passes a smoke
+test against a fake node (`server/tests/smoke_test.py`). **Nothing has run on an
+ESP32 yet**: no radio link, no real gateway, no flash filesystem, and the full
+docker stack has never been started.
 
 Do the Phase 1 bench tests first ([phase1-bringup.md](phase1-bringup.md)); they
 can change constants used here.
@@ -69,6 +71,28 @@ Wire it to I2C (SDA 21, SCL 22, 3.3 V), coin cell fitted, flash `node`.
 | Gateway time sync | `clock set from gateway … RTC updated` | |
 | After a week | drift under a few seconds (compare with `status`) | |
 
+## Step 5 — data log and backfill (two boards, gateway + broker running)
+
+The node stores telemetry and events on its internal flash and uploads them when
+the gateway acknowledges (PLAN section 12.1). The first boot formats the
+filesystem and takes a few seconds longer. Works with `node-sim` too.
+
+| Check | Expected | OK? |
+|---|---|---|
+| First boot | `log: 0 records stored`, no reset loop | |
+| `status` after a few minutes | `log: 0 waiting to upload`, stored count rising | |
+| `log dump 5` | CSV lines `seq,T,<utc>,…` and `seq,E,…` with plausible values | |
+| Unplug the gateway for 15 min, water a zone meanwhile | node prints `no acknowledgement, keeping data in the log` once; `status` shows the backlog growing | |
+| Plug the gateway back in | `link: back, N records to upload`; backlog falls to 0, about one record every 3–4 s | |
+| `mosquitto_sub -v -t 'garden/#'` during catch-up | old samples and the watering events arrive on `…/backfill` topics with their original `t` | |
+| Garden map / Home Assistant during catch-up | current values are not replaced by old ones | |
+| Gateway running but broker stopped for 10 min | same behaviour: nothing lost | |
+| Reset the node during catch-up | resumes; at most a few records repeated, none missing | |
+| Send a `water` command during catch-up | accepted within a few seconds | |
+| `server/data/archive/…jsonl` afterwards, then `tools/export_dataset.py` | no gap in `telemetry.csv` across the outage | |
+| Node with no clock (no RTC, gateway off) | telemetry not logged (`status`: stored count only rises with events) | |
+| After a week | `status`: flash use steady, `lost 0`; `log` shows no write errors | |
+
 ## Known limitations (deliberate, to do next)
 
 - **Clock**: DS3231 support is written but untested (see Step 4). Without the
@@ -78,8 +102,10 @@ Wire it to I2C (SDA 21, SCL 22, 3.3 V), coin cell fitted, flash `node`.
 - Radio collisions (node telemetry vs. a command) are only handled by retrying.
   `LINK_RETRY_MS` must be set from the air rate chosen in the range test.
 - Zone settings are compile-time constants; the NVS/JSON settings module, the
-  LCD/knob UI, service WiFi, HOA switch inputs, INA219 and local data log with
-  backfill are not written yet.
+  LCD/knob UI, service WiFi, HOA switch inputs and INA219 are not written yet.
+- Data log: while catching up after an outage, telemetry on the dashboards lags
+  until the queue is empty (status stays live). No SD card support yet.
+- The weather forecast used for decisions is not archived yet.
 - Soil probes are identified by bus order, not by address.
 - Valves are driven from GPIOs; the I2C-expander backend comes with the IO board.
 - Whether the YF-S201 can measure drip flow is still open (Phase 1, test 4). If

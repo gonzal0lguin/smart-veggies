@@ -1,10 +1,62 @@
-# Automated Garden — Master Plan (v0.2)
+# Automated Garden — Master Plan (v0.3)
 
-Status: architecture agreed. Phase 1 (bench bring-up) is waiting for hardware, see
+Status: architecture agreed; the current state and next steps are in the first section below. Phase 1 (bench bring-up) is waiting for hardware, see
 [phase1-bringup.md](phase1-bringup.md). The Phase 2/3 software (protocol, irrigation
 core, node app with simulator, gateway, server stack) is written and unit-tested on
 the PC but **not yet run on hardware**, see [phase2-testing.md](phase2-testing.md). Items marked **[VERIFY]** are facts that must
 be checked against the actual part / datasheet / site before we commit.
+
+## Where we are — resume here
+
+This section is the hand-over between work sessions: read it first, update it last.
+*Last updated 2026-11-16, branch `dev`.*
+
+State words: **done** = written and checked as far as possible without hardware
+(compiles, unit tests / smoke test pass) · **bench** = needs the hardware checklist ·
+**todo** = not written.
+
+| Phase | Step | State | Where / how to check |
+|---|---|---|---|
+| 0 | Plan, repo, CI | done | this file; `.github/workflows/ci.yml` (first run happens on the first push) |
+| 1 | Bring-up firmwares: `lora_range`, `soil`, `flow`, `valves`, `climate` | bench | [phase1-bringup.md](phase1-bringup.md), result tables empty |
+| 2 | Link protocol, signed commands, ack/retry | done, bench | `lib/protocol`, `lib/lora_link`; phase2-testing step 2 |
+| 2 | Gateway (LoRa ⇄ MQTT, HA discovery, time sync) | done, bench | `src/gateway`; step 2 |
+| 2 | Server stack, garden-brain, garden map, fake node | done (smoke-tested with a fake node; full stack never started) | `server/`, `server/tests/smoke_test.py` |
+| 3 | Irrigation core, safety limits, scheduler | done, bench | `lib/irrigation`, `lib/scheduler`; steps 1 and 3 |
+| 3 | DS3231 clock | done, bench | `lib/rtc`, `lib/timeconv`; step 4 |
+| 3 | Data log on flash + backfill after outages | done, bench | `lib/datalog`; step 5; design in section 12 |
+| 3 | Raw archive + dataset export on the server | done | `garden-brain` `Archive`, `server/tools/export_dataset.py` |
+| 3 | Settings module (zone limits, periods at runtime, NVS/JSON) | **todo — next** | replaces the `ZONE_*` constants in `config.h` |
+| 3 | Rain-skip survives reboot · daylight-saving rule | todo | small; rain-skip needs the clock, not uptime |
+| 3 | HOA switch inputs, INA219 supply/valve current | todo | needs the MCP23017 / INA219 modules to test |
+| 3 | `ValveBank` MCP23017 backend | todo | section 4.10; frees the SPI pins |
+| 3 | LCD + knob UI, service WiFi + OTA | todo | display choice in 4.5 |
+| 3 | Forecast and recommendations published to MQTT so they are archived | todo | section 12.4 |
+| 4 | Core + IO-1 schematics and layout (KiCad), enclosure | todo | after the Phase 1 results; includes the microSD socket (12.2) |
+| 4 | SD card archive on the node | todo | section 12.2 |
+| 5 | Water budget, anomaly detection, planting journal, models | todo | sections 8 and 12.4 |
+
+**Waiting on you:** hardware to arrive → run Phase 1 (start with `lora_range`), then
+the steps in [phase2-testing.md](phase2-testing.md); write the results into the
+tables in those two files. Results that change the design: LoRa air rate,
+relay behaviour during reset, YF-S201 accuracy at drip flow, moisture sensor yield.
+
+**Next for a software session, in order:** settings module → persist rain-skip +
+DST → publish forecast/recommendation history → MCP23017 valve backend → HOA/INA219 →
+LCD/knob UI → service WiFi/OTA → KiCad.
+
+**Before and after any change:**
+
+```bash
+cd firmware
+pio test -e native            # 58 host tests (pio may live at ~/.platformio/penv/bin/pio)
+./scripts/test.sh build-all   # every firmware compiles (gateway only if include/secrets.h exists)
+cd ../server                  # needs a broker on localhost:1883, see the header of the test
+python3 tests/smoke_test.py
+```
+
+Conventions: commits go to `dev`; nothing is pushed without being asked; secrets
+live only in `firmware/include/secrets.h` and `server/.env` (both git-ignored).
 
 ## 0. Decisions taken (2026-11-16)
 
@@ -18,6 +70,7 @@ be checked against the actual part / datasheet / site before we commit.
 | Control box location | Mostly in sun (≈9:00–16:00) → sunlight-readable monochrome LCD, light-coloured/shaded enclosure, thermal margin |
 | PCB | Hand-soldered carrier board for devkit modules, **stackable/modular** (section 4.9) |
 | Ethernet | Future option; header reserved |
+| Data storage | **Both, with different jobs** (section 12): the server keeps everything permanently (raw archive + InfluxDB); the node keeps about two weeks on its internal flash so outages lose nothing; a microSD socket on the Core board is an optional long-term local copy |
 | Timeline | Working prototype in ~1 month; full system open-ended; budget available for extra parts |
 
 ---
@@ -333,7 +386,7 @@ breadboard prototype drives everything directly and is already close to full:
 | Flow pulses ×3 (4th possible on 39) | 34, 35, 36 | same: input-only pins, need real interrupts |
 | DHT11 | 14 | freed (SHT3x/4x is on I2C) |
 | 6 relays | 18, 19, 23, 26, 32, 13 | **moved to an I2C expander**, frees all six |
-| Still to place | | display (SPI 18/23 + CS), knob (3), watchdog heartbeat, sensor-rail switch, RS-485 (3), W5500 (MISO 19, CS, INT) |
+| Still to place | | display (SPI 18/23 + CS), microSD (same SPI + MISO 19 + its own CS), knob (3), watchdog heartbeat, sensor-rail switch, RS-485 (3), W5500 (MISO 19, CS, INT) |
 
 So the answer to "what if we run out": **nothing slow gets a raw GPIO on the final
 boards.**
@@ -402,7 +455,7 @@ firmware/
 │   ├── timekeeping/      DS3231, time sync from gateway
 │   ├── irrigation/       zone state machines, dosing by time/volume, safety interlocks, fault handling
 │   ├── scheduler/        programs (time/weekday/sunrise offset), soil-threshold rules, rain-skip flag from server
-│   ├── datalog/          ring log on LittleFS, backfill after link outage
+│   ├── datalog/          segment log on LittleFS used as the upload outbox (section 12); SD backend later
 │   ├── telemetry/        builds periodic and event messages
 │   ├── commands/         validates + executes remote intents
 │   ├── settings/         NVS + JSON (as in the blinds firmware)
@@ -437,15 +490,16 @@ Gateway → node messages carry a rolling 32-bit counter and end with a 4-byte
 truncated HMAC-SHA-256 (shared key in `include/secrets.h`) over header + payload.
 The node accepts only a counter above the last accepted one (persisted), so a
 recorded command cannot be replayed; commands also carry an expiry time.
-TELEMETRY, STATUS, EVENT, CMD, TIME and ACK are implemented; BACKFILL and CONFIG
-are reserved.
+TELEMETRY, STATUS, EVENT, CMD, TIME and ACK are implemented; CONFIG is reserved.
+There is no separate backfill message: telemetry and events always travel through
+the node's flash log and are acknowledged one by one (section 12.1), so catching
+up after an outage is the normal path, just with a longer queue.
 
 | Type | Direction | Content |
 |---|---|---|
-| TELEMETRY | node → gw | compact sensor snapshot, every 1–5 min (config) |
+| TELEMETRY | node → gw | compact sensor snapshot, every 1–5 min (config); logged, acked + retried |
 | STATUS | node → gw | zone states, faults, uptime, supply V, RSSI, on change + heartbeat |
-| EVENT | node → gw | watering started/finished (litres, duration), faults, HOA changes; acked + retried |
-| BACKFILL | node → gw | logged records missed during an outage, sent slowly when idle |
+| EVENT | node → gw | watering started/finished (litres, duration), faults, HOA changes; logged, acked + retried |
 | CMD | gw → node | intents: water zone X litres/minutes (with expiry), stop all, skip next, set mode; authenticated, acked |
 | CONFIG | both | get/set a settings key (schedules, thresholds), chunked |
 | TIME | gw → node | epoch sync |
@@ -458,6 +512,7 @@ For solar we can move to wake-on-radio or "node polls after each uplink".
 
 ```
 garden/<node>/telemetry      garden/<node>/status       garden/<node>/event
+garden/<node>/telemetry/backfill   garden/<node>/event/backfill   (data older than 10 min: history, not current state)
 garden/<node>/cmd            garden/<node>/cmd/result    garden/<node>/config/…
 garden/gateway/status        garden/brain/recommendation
 homeassistant/…/config       (auto-discovery, published by the gateway)
@@ -518,7 +573,8 @@ Phases 2 and 3 firmware can largely be developed in simulator mode while parts s
 - Drip hardware: filter, pressure reducer, tubing, emitters, fittings
 - Possibly: low-flow sensors (YF-S401/S402 class), 4th valve
 - IP65 enclosures, cable glands, vent plug, pluggable terminal blocks, conformal coating
-- SSD + USB adapter for the Pi 4
+- SSD + USB adapter for the Pi 4; somewhere to send backups (second disk, NAS or cloud bucket)
+- microSD breakout, **3.3 V type without level shifter**, + high-endurance/industrial card (optional local archive, section 12.2)
 - 12 V outdoor-rated supply (≥2 A)
 
 ---
@@ -532,3 +588,107 @@ Answered ones are recorded in section 0. Still open:
 2. Enclosure size/model → board outline for the stack.
 3. Whether tomatoes and lettuce get separate zones inside a box (3 zones for 2 boxes
    leaves one free).
+
+---
+
+## 12. Data storage
+
+Question: server, SD card on site, or both? **Both, but with different jobs.**
+The server is the permanent record and the place where analysis happens. The node
+only has to make sure nothing is lost on the way there, and optionally keeps its
+own long-term copy.
+
+| Tier | Where | Holds | Job | State |
+|---|---|---|---|---|
+| A | Node, internal flash (LittleFS, ~1 MiB) | ~14 days at one sample/minute (20 480 records), all events | Outbox: survive link, gateway, WiFi, server or power outages | written, host-tested |
+| B | Node, microSD (optional) | years, as daily CSV files | Independent local copy; readable with a laptop if everything else is gone | planned (hardware in Phase 4) |
+| C | Server, raw archive (JSON lines per day) | everything ever published on `garden/#`, untouched | **System of record**; source for exports and for rebuilding any database | written, smoke-tested |
+| D | Server, InfluxDB | the same data, tagged by bed/zone | Dashboards (Grafana, HA), queries | written, never run |
+| E | Backups | copy of C, D and the HA config | Disk failure, mistakes | to set up with the Pi |
+
+### 12.1 Node flash log (tier A) — `firmware/lib/datalog`
+
+- Every telemetry sample and every event is first appended to the log, then
+  uploaded oldest-first, one record at a time, each waiting for the gateway's ACK.
+  The gateway only acknowledges while it is connected to the broker, so a WiFi or
+  server outage is covered the same way as a radio outage.
+- Delivery is at-least-once: after a reboot a few records may be sent twice. The
+  server side is idempotent (same timestamp overwrites in InfluxDB, events are
+  de-duplicated by time + id).
+- Catching up is paced (`BACKFILL_GAP_MS`, 3 s between records) so commands still
+  get through. A full two-week backlog takes about 17 hours; live *status* keeps
+  flowing meanwhile, live *telemetry* resumes when the queue is empty.
+- Data older than 10 minutes is published on `.../backfill` topics: stored with
+  its own timestamp, never shown as the current value.
+- Format: append-only segment files of 256 fixed 48-byte records with a CRC each;
+  when the quota (`LOG_MAX_SEGMENTS`) is reached the oldest segment is deleted and
+  counted as lost if it was never uploaded. A torn write after a power cut costs
+  one record. Flash wear is negligible (about one erase per block per day).
+- Samples taken while the clock is not set are only sent live (they could not be
+  placed in time later). With the DS3231 fitted this only happens before first use.
+- Console: `log` (state), `log dump <n>` (last n records as CSV), `log clear`;
+  `status` shows the backlog.
+
+### 12.2 microSD on the node (tier B) — optional, not on the critical path
+
+Worth having as a footprint on the Core board because it is cheap; the firmware
+for it can come later since tier A already covers outages.
+
+- **Hardware:** microSD socket on the SPI bus shared with the display (SCK 18,
+  MOSI 23, MISO 19, own chip-select). Use a 3.3 V breakout **without** a 5 V level
+  shifter (those often do not release MISO, which blocks other SPI devices).
+  Pull-up on chip-select, 10 µF next to the socket. On the breadboard those pins
+  drive relays, so the card arrives together with the MCP23017 valve backend.
+- **Card:** high-endurance or industrial grade; the box sits in the sun and
+  ordinary cards fail early when hot. FAT32, so any laptop reads it.
+- **Firmware (todo):** one CSV file per day (`/2026/11/2026-11-16.csv`, same
+  columns as `log dump`), written from the same records that go into tier A. The
+  node never depends on the card: a missing or failing card raises an event and
+  everything else carries on.
+- **When it earns its place:** a season without a gateway, a second node far from
+  any network, or simply wanting a copy that does not depend on the house.
+
+### 12.3 Server (tiers C, D, E)
+
+- **Raw archive:** `garden-brain` appends every `garden/#` message (telemetry,
+  events, status, commands and their results, gateway health, recommendations) to
+  `server/data/archive/<year>/<date>.jsonl` with its arrival time. Plain text,
+  append-only, about 0.5 MB per day at one sample a minute (under 200 MB a year;
+  compress old years if it ever matters). Because it is the untouched input, a
+  change of database, schema or analysis never loses history.
+- **InfluxDB:** written from the same messages, tagged with bed and zone from
+  `garden.yaml`. Keep raw resolution; the volume is small. If it ever grows,
+  add a downsampled bucket (5-minute and hourly means) rather than deleting.
+- **Home Assistant** keeps its own short history for its UI; it is not the record.
+- **Backups (to set up):** nightly copy of `server/data/`, an `influx backup`
+  dump and the HA config to a second place (another disk, NAS or cloud bucket;
+  `restic` or `rsync`). The archive is append-only, so incremental copies are
+  tiny. The Pi boots from SSD, not an SD card.
+
+### 12.4 From data to analysis and models
+
+- `server/tools/export_dataset.py <archive> <out>` writes `telemetry.csv` (one row
+  per sample) and `events.csv` (watering runs with litres and seconds, faults,
+  boots), sorted by the node's timestamp and de-duplicated. That is the hand-over
+  to pandas / notebooks / any training code.
+- What a useful model needs besides sensor readings, and where it comes from:
+
+  | Input | Source | State |
+  |---|---|---|
+  | Moisture, soil/air temperature, humidity | telemetry | logged |
+  | Water applied per zone (litres, when, why) | events | logged |
+  | Commands and who sent them | `cmd`, `cmd/result` in the archive | logged |
+  | Weather forecast as it was at decision time, and actual weather | Open-Meteo via `garden-brain` | **todo**: publish to `garden/brain/forecast` so it is archived |
+  | Recommendations and whether they were applied | `garden/brain/recommendation` | archived once the brain runs |
+  | What grows where, planting dates, growth stage | `garden.yaml` (history through git), later the planting journal | partly |
+  | Sensor calibration and zone flow constants | node settings | todo: report them once per boot |
+  | Photos | camera (Phase 6) | later |
+
+- First targets, in order of usefulness: drying rate per bed (how fast moisture
+  falls against temperature and humidity), response per litre (how far 1 L moves
+  the reading), then next-day moisture prediction to size the morning dose.
+  A season of data at one sample a minute is roughly 250 000 rows per sensor:
+  small enough for a laptop, large enough for these models.
+- Train on the PC or the Pi, never on the node. A model's output reaches the
+  garden the same way as everything else from the server: as an expiring dosing
+  intent that the node's safety layer can refuse.
