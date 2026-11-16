@@ -15,6 +15,7 @@
 #include <esp_task_wdt.h>
 
 #include "config.h"
+#include "ds3231.h"
 #include "e32.h"
 #include "flow_meter.h"
 #include "irrigation.h"
@@ -23,6 +24,7 @@
 #include "scheduler.h"
 #include "serial_cmd.h"
 #include "soil_moisture.h"
+#include "timeconv.h"
 #include "valves.h"
 
 enum Source : uint8_t { SRC_CONSOLE = 1, SRC_SCHEDULE = 2, SRC_REMOTE = 3 };
@@ -81,8 +83,9 @@ static float soilMv[proto::SOIL_CHANNELS];
 static float soilTemp[SOIL_TEMP_COUNT];
 static float airTemp = NAN, airRh = NAN;
 
-// Wall clock: set by the gateway (TIME) or the console. No RTC yet (Phase 3:
-// DS3231), so after a power cut schedules wait until the first time sync.
+// Wall clock: set by the gateway (TIME) or the console and mirrored to the
+// DS3231 if one is fitted, which restores it at boot. Without the RTC, schedules
+// wait for the first time sync after a power cut.
 static struct {
     bool valid = false;
     uint32_t baseEpoch = 0, baseMs = 0;
@@ -104,6 +107,23 @@ static struct {
     }
     uint32_t local() { return valid ? utc() + (int32_t)tzMin * 60 : 0; }
 } wallClock;
+
+static Ds3231 rtc;
+static bool rtcPresent = false;
+
+// Every clock change goes through here: RAM clock, RTC chip, and the timezone in NVS.
+static void setClock(uint32_t epoch, int16_t tzMin, const char* source) {
+    if (epoch < timeconv::MIN_VALID_EPOCH) {
+        Serial.printf("clock: ignoring implausible time %u from %s\n", epoch, source);
+        return;
+    }
+    wallClock.set(epoch);
+    if (tzMin != wallClock.tzMin || !prefs.isKey("tz")) prefs.putShort("tz", tzMin);
+    wallClock.tzMin = tzMin;
+    bool saved = rtcPresent && rtc.write(epoch);
+    Serial.printf("clock set from %s: %u (tz %+d min)%s\n", source, epoch, tzMin,
+                  saved ? ", RTC updated" : rtcPresent ? ", RTC WRITE FAILED" : "");
+}
 
 static uint32_t uptimeS() {
     static uint32_t lastMs = 0, secs = 0, frac = 0;
@@ -314,9 +334,7 @@ static void onAuthenticated(proto::Frame& f) {
     prefs.putUInt("counter", cmdCounter);
     uint8_t result = proto::ACK_OK, detail = 0;
     if (isTime) {
-        wallClock.tzMin = t.tzMinutes;
-        wallClock.set(t.epoch);
-        Serial.printf("clock set: %u (tz %+d min)\n", t.epoch, t.tzMinutes);
+        setClock(t.epoch, t.tzMinutes, "gateway");
     } else if (c.expiry && wallClock.valid && wallClock.utc() > c.expiry) {
         result = proto::ACK_EXPIRED;
     } else {
@@ -390,6 +408,15 @@ static void printStatus() {
     Serial.printf("\nuptime %us  clock %s (utc %u, tz %+d)  auto %s  radio %s  link tx %u rx %u retries %u failed %u\n",
                   uptimeS(), wallClock.valid ? "ok" : "NOT SET", wallClock.utc(), wallClock.tzMin, autoMode ? "on" : "off",
                   radioOk ? "ok" : "MISSING", lora.txCount, lora.rxCount, lora.retries, lora.failed);
+    if (wallClock.valid) {
+        timeconv::Civil c = timeconv::fromEpoch(wallClock.local());
+        Serial.printf("  local time %04u-%02u-%02u %02u:%02u:%02u  ", c.year, c.month, c.day, c.hour, c.minute, c.second);
+    } else {
+        Serial.print("  local time unknown: schedules are waiting for a time sync  ");
+    }
+    float boxC;
+    if (rtcPresent && rtc.temperature(boxC)) Serial.printf("RTC ok, box %.1f C\n", boxC);
+    else Serial.println(rtcPresent ? "RTC read error" : "RTC not fitted");
     for (uint8_t z = 0; z < VALVE_COUNT; z++) {
         float m = zoneMoisture(z);
         Serial.printf("  zone %u: %-8s valve %s  fault 0x%02X  today %.1f L  soil %s%.0f %%\n", z + 1, stateName(ctl.state(z)),
@@ -467,8 +494,7 @@ static void handleLine(const char* line) {
         prefs.putBool("auto", autoMode);
         statusDue = true;
     } else if (!strcmp(cmd, "time") && n >= 2) {
-        if (n >= 3) wallClock.tzMin = (int16_t)atoi(s2);
-        wallClock.set(strtoul(s1, nullptr, 10));
+        setClock(strtoul(s1, nullptr, 10), n >= 3 ? (int16_t)atoi(s2) : wallClock.tzMin, "console");
     } else if (!strcmp(cmd, "prog") && i1 >= 1 && i1 <= sched::MAX_PROGRAMS && n >= 3) {
         sched::Program& p = schedule.programs[i1 - 1];
         unsigned hh = 0, mm = 0, zone = (unsigned)atoi(s2);
@@ -553,6 +579,7 @@ void setup() {
     prefs.begin("node", false);
     autoMode = prefs.getBool("auto", true);
     cmdCounter = prefs.getUInt("counter", 0);
+    wallClock.tzMin = prefs.getShort("tz", 0);
     prefs.getBytes("progs", schedule.programs, sizeof(schedule.programs));
     if (ctl.config().masterValve == irr::NONE) valves.setExclusive(true);
 
@@ -560,6 +587,14 @@ void setup() {
     simBegin();
 #else
     Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL, I2C_FREQ_HZ);
+    rtcPresent = rtc.probe();
+    uint32_t rtcEpoch = 0;
+    if (rtcPresent && rtc.read(rtcEpoch)) {
+        wallClock.set(rtcEpoch);
+        Serial.printf("RTC: clock restored, %u UTC (tz %+d min)\n", rtcEpoch, wallClock.tzMin);
+    } else {
+        Serial.println(rtcPresent ? "RTC: found but time not set (new chip or flat coin cell)" : "RTC: DS3231 not found");
+    }
     for (uint8_t i = 0; i < FLOW_COUNT; i++) flow[i].begin(flowPins[i], FLOW_PULSES_PER_LITRE);
     soil.begin(adsAddresses, sizeof(adsAddresses), adcPins, sizeof(adcPins));
     loadCalibration();

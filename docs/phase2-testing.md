@@ -55,10 +55,24 @@ step 1 with real water, including closing the tap mid-run (no-flow fault) and
 opening a line end (burst fault). Tune `ZONE_*` limits in `include/config.h`
 to the measured zone flow.
 
+## Step 4 — DS3231 clock (when the module arrives)
+
+Wire it to I2C (SDA 21, SCL 22, 3.3 V), coin cell fitted, flash `node`.
+
+| Check | Expected | Result |
+|---|---|---|
+| Boot with a new chip | `RTC: found but time not set` | |
+| `time <utc_epoch> <tz_minutes>` on the console | `clock set from console … RTC updated` | |
+| `status` | correct local date/time, `RTC ok, box <temp> C` | |
+| Unplug power for a minute, plug back in | `RTC: clock restored`, time and timezone correct | |
+| Same with the gateway off | a program set with `prog` still starts on time | |
+| Gateway time sync | `clock set from gateway … RTC updated` | |
+| After a week | drift under a few seconds (compare with `status`) | |
+
 ## Known limitations (deliberate, to do next)
 
-- **No RTC yet**: after a power cut, schedules wait until the gateway has set the
-  clock. DS3231 support is the first Phase 3 item.
+- **Clock**: DS3231 support is written but untested (see Step 4). Without the
+  chip, schedules wait after a power cut until the gateway has set the clock.
 - Rain-skip is kept in RAM and lost on reboot.
 - Time zone is a fixed offset in `secrets.h`; no automatic daylight saving.
 - Radio collisions (node telemetry vs. a command) are only handled by retrying.
