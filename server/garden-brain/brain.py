@@ -1,8 +1,10 @@
 """garden-brain: the server-side logic of smart-veggies.
 
-v0 does four things:
+v0 does five things:
   * keeps the latest node state from MQTT and logs it to InfluxDB, tagged with
     bed/zone from garden.yaml (so dashboards are per bed, not per channel);
+  * appends every garden/# message, untouched, to daily JSON-lines files
+    (ARCHIVE_DIR): the permanent raw record, independent of any database;
   * serves the garden map (beds, zones, plantings, live data) on :8080;
   * fetches the Open-Meteo forecast and publishes a rain-skip recommendation;
   * (optional, rules.auto_apply) sends the rain-skip command itself.
@@ -23,6 +25,36 @@ import yaml
 HERE = Path(__file__).parent
 
 
+class Archive:
+    """Raw MQTT messages as JSON lines, one file per UTC day: <dir>/2026/2026-11-16.jsonl.
+
+    This is the system of record. InfluxDB can be rebuilt from it, and
+    tools/export_dataset.py turns it into tables for analysis and model training.
+    """
+
+    def __init__(self, directory):
+        self.dir = Path(directory) if directory else None
+        self.lock = threading.Lock()
+
+    def write(self, topic, payload):
+        if not self.dir:
+            return
+        now = time.time()
+        try:
+            data = json.loads(payload)
+        except ValueError:
+            data = payload.decode(errors="replace") if isinstance(payload, bytes) else str(payload)
+        day = time.strftime("%Y-%m-%d", time.gmtime(now))
+        try:
+            with self.lock:
+                folder = self.dir / day[:4]
+                folder.mkdir(parents=True, exist_ok=True)
+                with open(folder / f"{day}.jsonl", "a") as f:
+                    f.write(json.dumps({"rx": round(now, 3), "topic": topic, "data": data}, separators=(",", ":")) + "\n")
+        except OSError as e:  # a full or missing disk must not stop the rest
+            print("archive write failed:", e, flush=True)
+
+
 class Garden:
     """garden.yaml plus the latest data received from the node."""
 
@@ -32,6 +64,7 @@ class Garden:
         self.lock = threading.Lock()
         self.telemetry, self.status, self.gateway = {}, {}, {}
         self.events = []          # newest first, last 50
+        self._event_keys = []
         self.forecast = None      # {"rain_24h_mm": .., "et0_today_mm": .., "fetched": ..}
         self.recommendation = None
         self.last_seen = 0
@@ -49,19 +82,34 @@ class Garden:
             data = json.loads(payload)
         except ValueError:
             return []
-        kind = topic.split("/")[-1]
+        base = f"garden/{self.node}/"
         with self.lock:
-            if topic == "garden/gateway/status":
+            if topic == "garden/gateway/status" and isinstance(data, dict):
                 self.gateway = data
+                return []
+            if not topic.startswith(base) or not isinstance(data, dict):
+                return []
+            kind = topic[len(base):]
+            # ".../backfill" is history the node kept through an outage: it is
+            # stored with its own timestamp but never becomes the current state.
+            late = kind.endswith("/backfill")
+            if late:
+                kind = kind[:-len("/backfill")]
+            if kind not in ("telemetry", "status", "event"):
                 return []
             self.last_seen = time.time()
             if kind == "telemetry":
-                self.telemetry = data
+                if not late:
+                    self.telemetry = data
                 return self._telemetry_lines(data)
             if kind == "status":
                 self.status = data
             elif kind == "event":
-                self.events = ([data] + self.events)[:50]
+                key = (data.get("t"), data.get("id"), data.get("event"))
+                if data.get("id") is not None and key in self._event_keys:
+                    return []  # delivered twice (the node resends until acknowledged)
+                self._event_keys = (self._event_keys + [key])[-200:]
+                self.events = sorted([data] + self.events, key=lambda e: e.get("t") or 0, reverse=True)[:50]
                 return self._event_lines(data)
         return []
 
@@ -244,10 +292,16 @@ def main():
 
     def on_connect(c, userdata, flags, reason, props):
         print("mqtt connected:", reason, flush=True)
-        c.subscribe([(f"{base}/telemetry", 0), (f"{base}/status", 0), (f"{base}/event", 1), ("garden/gateway/status", 0)])
+        c.subscribe("garden/#", qos=1)  # everything is archived; Garden picks what it understands
+
+    archive = Archive(os.environ.get("ARCHIVE_DIR"))
+
+    def on_message(c, userdata, m):
+        archive.write(m.topic, m.payload)
+        influx_write(garden.on_message(m.topic, m.payload))
 
     client.on_connect = on_connect
-    client.on_message = lambda c, u, m: influx_write(garden.on_message(m.topic, m.payload))
+    client.on_message = on_message
     client.connect_async(os.environ.get("MQTT_HOST", "localhost"), int(os.environ.get("MQTT_PORT", "1883")))
     client.loop_start()
 

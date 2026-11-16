@@ -32,3 +32,6 @@
 *.app
 
 .vscode/
+# server runtime data (raw message archive) and local settings
+server/data/
+server/.env

@@ -55,9 +55,11 @@ services:
       MQTT_PASSWORD: ${MQTT_PASSWORD}
       INFLUX_URL: http://influxdb:8086
       INFLUX_TOKEN: ${INFLUX_TOKEN}
+      ARCHIVE_DIR: /data/archive
       TZ: ${TZ}
     volumes:
       - ./garden.yaml:/app/garden.yaml:ro
+      - ./data:/data                # raw message archive: back this folder up
     depends_on: [mosquitto, influxdb]
 
 volumes:

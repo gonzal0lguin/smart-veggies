@@ -14,8 +14,10 @@ telemetry into the map state served on /api/state.
 import json
 import os
 import queue
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -67,8 +69,9 @@ def main():
     client.connect(HOST, PORT)
     client.loop_start()
 
+    archive_dir = tempfile.mkdtemp(prefix="garden-archive-")
     env = dict(os.environ, MQTT_HOST=HOST, MQTT_PORT=str(PORT), PORT=str(HTTP_PORT),
-               GARDEN_FILE=str(SERVER / "garden.yaml"), INFLUX_URL="")
+               GARDEN_FILE=str(SERVER / "garden.yaml"), INFLUX_URL="", ARCHIVE_DIR=archive_dir)
     procs = [
         subprocess.Popen([sys.executable, str(SERVER / "tools/fake_node.py"), "--host", HOST, "--port", str(PORT), "--fast"]),
         subprocess.Popen([sys.executable, str(SERVER / "garden-brain/brain.py")], env=env),
@@ -92,7 +95,12 @@ def main():
         check("bad zone refused", r.get("ok") is False)
 
         wait_for("telemetry after the run", lambda tp, d: tp == f"{BASE}/telemetry" and d["today_l"][1] > 0, timeout=20)
-        time.sleep(1)
+
+        # History caught up after an outage: stored, but never shown as the current value.
+        old_t = int(time.time()) - 86400
+        client.publish(f"{BASE}/telemetry/backfill", json.dumps({"t": old_t, "soil": [1.0] * 12, "soil_temp": [None, None],
+                                                                 "today_l": [0] * 6}), qos=1)
+        time.sleep(1.5)
         with urllib.request.urlopen(f"http://localhost:{HTTP_PORT}/api/state", timeout=5) as resp:
             state = json.load(resp)
         zones = [z for b in state["beds"] for z in b["zones"]]
@@ -101,11 +109,26 @@ def main():
         check("map shows zone 2 moisture and litres today", z2["moisture"] is not None and z2["today_l"] > 0)
         with urllib.request.urlopen(f"http://localhost:{HTTP_PORT}/", timeout=5) as resp:
             check("map page is served", resp.status == 200 and b"<html" in resp.read().lower())
+        check("backfilled telemetry did not replace the live reading", z2["moisture"] > 2)
         check("fake node and garden-brain still running", all(p.poll() is None for p in procs))
+
+        files = sorted(Path(archive_dir).rglob("*.jsonl"))
+        rows = [json.loads(line) for f in files for line in f.read_text().splitlines()]
+        topics = {r["topic"] for r in rows}
+        check("raw archive has telemetry, events, commands and the backfilled sample",
+              {f"{BASE}/telemetry", f"{BASE}/event", f"{BASE}/cmd", f"{BASE}/telemetry/backfill"} <= topics)
+        out = Path(archive_dir) / "export"
+        subprocess.run([sys.executable, str(SERVER / "tools/export_dataset.py"), archive_dir, str(out)], check=True)
+        tele = (out / "telemetry.csv").read_text().splitlines()
+        events = (out / "events.csv").read_text()
+        check("dataset export: telemetry sorted by time with the backfilled row first",
+              len(tele) >= 3 and tele[0].startswith("t,") and tele[1].split(",")[0] == str(old_t))
+        check("dataset export: events table has the finished run", "run_finished" in events)
     finally:
         for p in procs:
             p.terminate()
         client.loop_stop()
+        shutil.rmtree(archive_dir, ignore_errors=True)
     print("smoke test passed")
 
 

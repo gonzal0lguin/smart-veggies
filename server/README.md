@@ -49,4 +49,26 @@ mosquitto_pub -u garden -P '<...>' -t garden/node1/cmd -m '{"cmd":"water","zone"
 ## Remote access and backups
 
 Install Tailscale on the Pi for access from outside (no port forwarding).
-Back up the docker volumes `ha-config`, `influx-data` and `grafana-data` nightly.
+Back up nightly, to another disk or machine: the folder `data/` (raw archive, see
+below) and the docker volumes `ha-config`, `influx-data` and `grafana-data`.
+
+## Data
+
+Design: [../docs/PLAN.md](../docs/PLAN.md) section 12.
+
+- `data/archive/<year>/<date>.jsonl` — every `garden/#` message as received, one
+  JSON object per line (`rx` arrival time, `topic`, `data`). Written by
+  `garden-brain`; this is the permanent record and is git-ignored.
+- InfluxDB bucket `garden` — the same telemetry and watering events, tagged by
+  bed and zone, for Grafana.
+- Tables for analysis or model training:
+
+  ```bash
+  python3 tools/export_dataset.py data/archive out/ [--from 2026-11-01] [--to 2026-12-01]
+  # -> out/telemetry.csv, out/events.csv (sorted by the node's time, de-duplicated)
+  ```
+
+Data the node stored during an outage arrives later on
+`garden/<node>/telemetry/backfill` and `.../event/backfill`: it is archived and
+written to InfluxDB with its original timestamp, but does not change the live
+values on the map or in Home Assistant.
