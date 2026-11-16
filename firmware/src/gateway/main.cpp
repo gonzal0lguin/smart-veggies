@@ -44,6 +44,7 @@ static Preferences prefs;
 
 static uint32_t counter = 0;       // last used command counter (persisted)
 static uint16_t lastEventId = 0;
+static uint32_t lastEventEpoch = 0;
 static bool haveEvent = false;
 static bool nodeClockValid = false;
 static uint32_t lastTimeSyncMs = 0;
@@ -97,7 +98,19 @@ static const char* ackName(uint8_t r) {
     return r < 6 ? n[r] : "unknown";
 }
 
-static void onTelemetry(const proto::Telemetry& t) {
+// The node keeps every telemetry sample and event in its flash log until we
+// acknowledge it, so we only acknowledge what we can hand to the broker.
+// Data older than this is history being caught up after an outage: it goes to
+// .../backfill topics so it is stored but never shown as the current value.
+static const uint32_t LATE_S = 600;
+static bool isLate(uint32_t epoch) {
+    uint32_t now = (uint32_t)time(nullptr);
+    return epoch && now > 1700000000UL && now > epoch + LATE_S;
+}
+
+static void onTelemetry(const proto::Frame& f, const proto::Telemetry& t) {
+    if (!mqtt.connected()) return;  // no ACK: the node will send it again
+    lora.sendAck(f, proto::ACK_OK);
     JsonDocument d;
     d["t"] = t.epoch ? t.epoch : (uint32_t)time(nullptr);
     JsonArray soil = d["soil"].to<JsonArray>();
@@ -109,7 +122,7 @@ static void onTelemetry(const proto::Telemetry& t) {
     if (t.supplyMv) d["supply_v"] = t.supplyMv / 1000.0f;
     JsonArray today = d["today_l"].to<JsonArray>();
     for (uint16_t v : t.todayDl) today.add(v / 10.0f);
-    publish(T_BASE "/telemetry", d);
+    publish(isLate(t.epoch) ? T_BASE "/telemetry/backfill" : T_BASE "/telemetry", d);
 }
 
 static void onStatus(const proto::Status& s) {
@@ -137,10 +150,12 @@ static void onStatus(const proto::Status& s) {
 }
 
 static void onEvent(const proto::Frame& f, const proto::Event& e) {
+    if (!mqtt.connected()) return;  // no ACK: the node will send it again
     lora.sendAck(f, proto::ACK_OK);
-    if (haveEvent && e.id == lastEventId) return;  // retry of one we already published
+    if (haveEvent && e.id == lastEventId && e.epoch == lastEventEpoch) return;  // retry of one we already published
     haveEvent = true;
     lastEventId = e.id;
+    lastEventEpoch = e.epoch;
     JsonDocument d;
     d["t"] = e.epoch ? e.epoch : (uint32_t)time(nullptr);
     d["id"] = e.id;
@@ -150,7 +165,7 @@ static void onEvent(const proto::Frame& f, const proto::Event& e) {
         d["litres"] = e.a / 1000.0f;
     } else if (e.code == proto::EV_BOOT) {
         d["reset_reason"] = e.detail;
-        nodeClockValid = false;  // it just rebooted and has no RTC yet
+        if (!e.epoch) nodeClockValid = false;  // it just rebooted with no clock: sync it now
     } else {
         d["zone"] = e.zone + 1;
         if (e.code == 1) {
@@ -162,7 +177,7 @@ static void onEvent(const proto::Frame& f, const proto::Event& e) {
             d["detail"] = e.code == 3 ? faultName(e.detail) : endReason(e.detail);
         }
     }
-    publish(T_BASE "/event", d);
+    publish(isLate(e.epoch) ? T_BASE "/event/backfill" : T_BASE "/event", d);
 }
 
 // ---------------------------------------------------------------- MQTT -> LoRa
@@ -386,7 +401,7 @@ void loop() {
         proto::Telemetry t;
         proto::Status s;
         proto::Event e;
-        if (proto::decode(f, t)) onTelemetry(t);
+        if (proto::decode(f, t)) onTelemetry(f, t);
         else if (proto::decode(f, s)) onStatus(s);
         else if (proto::decode(f, e)) onEvent(f, e);
     }

@@ -63,6 +63,12 @@
 #define STATUS_PERIOD_S 300
 #define LINK_RETRY_MS 4000         // > air time of frame + ack at the chosen air rate
 #define LINK_ATTEMPTS 4
+
+// Data log on the internal flash (lib/datalog). 80 segments x 256 records x 48 B
+// = 0.96 MiB of the 1.4 MiB filesystem: 14 days at one sample a minute.
+#define LOG_MAX_SEGMENTS 80
+#define BACKFILL_GAP_MS 3000       // pause between records while catching up after an outage
+#define LOG_RETRY_S 60             // wait this long after an upload nobody acknowledged
 // Shared secret for command authentication. Override in include/secrets.h
 // (not committed); the default only exists so a fresh checkout builds.
 #if __has_include("secrets.h")

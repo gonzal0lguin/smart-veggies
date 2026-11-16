@@ -15,9 +15,11 @@
 #include <esp_task_wdt.h>
 
 #include "config.h"
+#include "datalog.h"
 #include "ds3231.h"
 #include "e32.h"
 #include "flow_meter.h"
+#include "fs_storage.h"
 #include "irrigation.h"
 #include "link.h"
 #include "messages.h"
@@ -49,6 +51,8 @@ static E32 radio(Serial2, PIN_LORA_RX, PIN_LORA_TX, PIN_LORA_MODE, PIN_LORA_AUX)
 static LoraLink lora(radio, NODE_ADDRESS);
 static Preferences prefs;
 static LineReader console;
+static FsStorage logStore;
+static dlog::Log datalog(logStore, LOG_MAX_SEGMENTS);
 
 static irr::Config makeIrrConfig() {
     irr::Config c;
@@ -77,6 +81,16 @@ static proto::Ack lastCmdAck;         // re-sent when the gateway retries the sa
 static uint16_t eventId = 0;
 static uint32_t rainSkipUntilS = 0;   // uptime seconds; schedules suspended until then
 static bool statusDue = true;
+
+// Outbox: telemetry and events are appended to the flash log and uploaded
+// oldest-first, one at a time, each waiting for the gateway's ACK.
+static bool logOk = false;
+static uint32_t savedCursor = 0;      // upload position as stored in NVS
+static bool outboxBusy = false;       // a logged record is in the link queue
+static uint32_t outboxRecord = 0;     // its log sequence number
+static uint8_t outboxFrameSeq = 0, outboxFrameType = 0;
+static uint32_t outboxNextMs = 0;
+static bool outboxStalled = false;    // last upload was not acknowledged
 
 static float soilPct[proto::SOIL_CHANNELS];
 static float soilMv[proto::SOIL_CHANNELS];
@@ -231,7 +245,9 @@ static void sendTelemetry() {
         t.todayDl[z] = (uint16_t)min<uint32_t>(ctl.dailyMl(z) / 100, 0xFFFF);
     proto::Frame f = lora.make(proto::ADDR_GATEWAY);
     proto::encode(t, f);
-    lora.send(f);
+    // Without a valid clock a sample cannot be placed in time later: send it live only.
+    if (logOk && wallClock.valid && datalog.append(f.type, f.payload, f.len)) return;
+    if (radioOk) lora.send(f);
 }
 
 static uint8_t statusFlags() {
@@ -276,8 +292,49 @@ static void sendEvent(uint8_t code, uint8_t zone, uint8_t detail, uint32_t a, ui
     e.b = b;
     proto::Frame f = lora.make(proto::ADDR_GATEWAY);
     proto::encode(e, f);
-    if (!lora.sendReliable(f)) Serial.println("link queue full: event not sent");
     statusDue = true;
+    if (logOk && datalog.append(f.type, f.payload, f.len)) return;
+    if (radioOk && !lora.sendReliable(f)) Serial.println("link queue full: event not sent");
+}
+
+// Remember the upload position now and then; a stale value only causes resends.
+static void saveCursor(bool force = false) {
+    uint32_t c = datalog.cursor();
+    if (c == savedCursor || (!force && datalog.backlog() && c - savedCursor < 16)) return;
+    savedCursor = c;
+    prefs.putUInt("logcur", c);
+}
+
+static void pumpOutbox() {
+    if (!radioOk || !logOk || outboxBusy || lora.pending()) return;
+    if ((int32_t)(millis() - outboxNextMs) < 0) return;
+    dlog::Record rec;
+    if (!datalog.peek(rec)) return saveCursor();  // may have skipped unreadable records
+    proto::Frame f = lora.make(proto::ADDR_GATEWAY);
+    f.type = rec.type;
+    f.len = rec.len;
+    memcpy(f.payload, rec.data, rec.len);
+    if (!lora.sendReliable(f)) return;
+    outboxBusy = true;
+    outboxRecord = rec.seq;
+    outboxFrameSeq = f.seq;
+    outboxFrameType = f.type;
+}
+
+static void onOutboxResult(bool acked) {
+    outboxBusy = false;
+    if (acked) {
+        datalog.ack(outboxRecord);
+        saveCursor();
+        if (outboxStalled) Serial.printf("link: back, %u records to upload\n", datalog.backlog());
+        outboxStalled = false;
+        // Catching up: leave gaps on the air so commands can still get through.
+        outboxNextMs = millis() + (datalog.backlog() > 1 ? BACKFILL_GAP_MS : 0);
+    } else {
+        if (!outboxStalled) Serial.println("link: no acknowledgement, keeping data in the log");
+        outboxStalled = true;
+        outboxNextMs = millis() + LOG_RETRY_S * 1000UL;
+    }
 }
 
 // Executes a verified, fresh command. Returns the ack result; `detail` gets irr::Reject.
@@ -365,7 +422,8 @@ static void pollLink() {
     }
     LoraLink::Result r;
     while (lora.popResult(r))
-        if (!r.acked) Serial.printf("link: frame type 0x%02X seq %u not acknowledged\n", r.frame.type, r.frame.seq);
+        if (outboxBusy && r.frame.seq == outboxFrameSeq && r.frame.type == outboxFrameType) onOutboxResult(r.acked);
+        else if (!r.acked) Serial.printf("link: frame type 0x%02X seq %u not acknowledged\n", r.frame.type, r.frame.seq);
 }
 
 // ------------------------------------------------------------------ schedules
@@ -423,6 +481,12 @@ static void printStatus() {
                       valves.isOpen(z) ? "OPEN" : "shut", ctl.fault(z), ctl.dailyMl(z) / 1000.0f, isnan(m) ? "n/a " : "",
                       isnan(m) ? 0.0f : m);
     }
+    if (logOk)
+        Serial.printf("  log: %u waiting to upload%s, %u stored (room for %u), lost %u, flash %u/%u KiB\n", datalog.backlog(),
+                      outboxStalled ? " (link down)" : "", datalog.head() - datalog.oldest(), datalog.capacity(), datalog.dropped,
+                      (unsigned)(logStore.usedBytes() / 1024), (unsigned)(logStore.totalBytes() / 1024));
+    else
+        Serial.println("  log: NOT AVAILABLE (data is only sent live)");
     for (uint8_t s = 0; s < FLOW_COUNT; s++) Serial.printf("  flow %u: %.2f L total%s\n", s + 1, flowMl(s) / 1000.0f,
                                                            ctl.leakMask() & (1u << s) ? "  LEAK ALARM" : "");
     Serial.printf("  air %.1f C %.0f %%RH   soil temp %.1f / %.1f C   run %.2f L\n", airTemp, airRh, soilTemp[0], soilTemp[1],
@@ -438,6 +502,34 @@ static void printPrograms() {
     }
 }
 
+// Last n records as CSV, readable on site with nothing but a laptop.
+static void printLog(uint32_t n) {
+    uint32_t from = datalog.head() - datalog.oldest() > n ? datalog.head() - n : datalog.oldest();
+    Serial.println("seq,kind,utc,values...   (T: soil % x12, soil C x2, air C, air %RH, litres today x6;  E: id,code,zone,detail,a,b)");
+    for (uint32_t seq = from; seq < datalog.head(); seq++) {
+        dlog::Record rec;
+        if (!datalog.read(seq, rec)) continue;
+        proto::Frame f;
+        f.type = rec.type;
+        f.len = rec.len;
+        memcpy(f.payload, rec.data, rec.len);
+        proto::Telemetry t;
+        proto::Event e;
+        if (proto::decode(f, t)) {
+            Serial.printf("%u,T,%u", seq, t.epoch);
+            for (uint8_t v : t.soilHalfPct) v == proto::NO_DATA_U8 ? Serial.print(",") : Serial.printf(",%.1f", v / 2.0f);
+            for (int16_t v : t.soilTempC100) v == proto::NO_DATA_I16 ? Serial.print(",") : Serial.printf(",%.2f", v / 100.0f);
+            t.airTempC100 == proto::NO_DATA_I16 ? Serial.print(",") : Serial.printf(",%.2f", t.airTempC100 / 100.0f);
+            t.airRhHalfPct == proto::NO_DATA_U8 ? Serial.print(",") : Serial.printf(",%.1f", t.airRhHalfPct / 2.0f);
+            for (uint16_t v : t.todayDl) Serial.printf(",%.1f", v / 10.0f);
+            Serial.println();
+        } else if (proto::decode(f, e)) {
+            Serial.printf("%u,E,%u,%u,%u,%u,%u,%u,%u\n", seq, e.epoch, e.id, e.code, e.zone, e.detail, e.a, e.b);
+        }
+        esp_task_wdt_reset();
+    }
+}
+
 static void help() {
     Serial.println("commands (zones and sensors are numbered from 1):");
     Serial.println("  status | sensors | progs");
@@ -449,6 +541,7 @@ static void help() {
     Serial.println("  time <utc_epoch> [tz_minutes]     set the clock by hand");
     Serial.println("  prog <n> <zone> <HH:MM> <litres> [days_hex=7F] [skip_above_pct=0]");
     Serial.println("  prog <n> off");
+    Serial.println("  log [dump <n> | clear]            data log: state, last n records, erase");
 #ifdef SIM
     Serial.println("  sim <zone> <ml_per_min>           simulated flow of a zone (0 = dead zone)");
 #else
@@ -495,6 +588,21 @@ static void handleLine(const char* line) {
         statusDue = true;
     } else if (!strcmp(cmd, "time") && n >= 2) {
         setClock(strtoul(s1, nullptr, 10), n >= 3 ? (int16_t)atoi(s2) : wallClock.tzMin, "console");
+    } else if (!strcmp(cmd, "log")) {
+        if (!logOk) {
+            Serial.println("log not available");
+        } else if (!strcmp(s1, "clear")) {
+            datalog.clear();
+            saveCursor(true);
+            outboxBusy = false;
+            Serial.println("log erased");
+        } else if (!strcmp(s1, "dump")) {
+            printLog((uint32_t)max(1, atoi(s2)));
+        } else {
+            Serial.printf("log: records %u..%u, next to upload %u, waiting %u, lost %u, unreadable %u, write errors %u\n",
+                          datalog.oldest(), datalog.head(), datalog.cursor(), datalog.backlog(), datalog.dropped, datalog.corrupt,
+                          datalog.writeErrors);
+        }
     } else if (!strcmp(cmd, "prog") && i1 >= 1 && i1 <= sched::MAX_PROGRAMS && n >= 3) {
         sched::Program& p = schedule.programs[i1 - 1];
         unsigned hh = 0, mm = 0, zone = (unsigned)atoi(s2);
@@ -583,6 +691,15 @@ void setup() {
     prefs.getBytes("progs", schedule.programs, sizeof(schedule.programs));
     if (ctl.config().masterValve == irr::NONE) valves.setExclusive(true);
 
+    savedCursor = prefs.getUInt("logcur", 0);
+    logOk = logStore.begin();  // first boot formats the filesystem: a few seconds
+    if (logOk) {
+        datalog.begin(savedCursor);
+        Serial.printf("log: %u records stored, %u waiting to upload\n", datalog.head() - datalog.oldest(), datalog.backlog());
+    } else {
+        Serial.println("log: filesystem NOT available, data will only be sent live");
+    }
+
 #ifdef SIM
     simBegin();
 #else
@@ -612,7 +729,7 @@ void setup() {
 
     esp_task_wdt_init(15, true);  // frozen firmware -> reset -> valves.begin() closes everything
     esp_task_wdt_add(nullptr);
-    if (radioOk) sendEvent(proto::EV_BOOT, proto::NO_ZONE, (uint8_t)esp_reset_reason(), 0, 0);
+    sendEvent(proto::EV_BOOT, proto::NO_ZONE, (uint8_t)esp_reset_reason(), 0, 0);
     help();
 }
 
@@ -637,7 +754,7 @@ void loop() {
     while (ctl.popEvent(e)) {
         Serial.printf("[%u] %s: zone/sensor %u detail %u  %.2f L  %u s\n", uptimeS(), eventName(e.code), e.zone + 1, e.detail,
                       e.a / 1000.0f, e.b);
-        if (radioOk) sendEvent((uint8_t)e.code, e.zone, e.detail, e.a, e.b);
+        sendEvent((uint8_t)e.code, e.zone, e.detail, e.a, e.b);
     }
 
     runSchedules();
@@ -647,16 +764,16 @@ void loop() {
         lastSensors = now ? now : 1;
         readSensors();
     }
-    if (radioOk && !lora.pending()) {  // events first; periodic data when the queue is empty
-        if (statusDue || now - lastStatus >= STATUS_PERIOD_S * 1000UL) {
-            statusDue = false;
-            lastStatus = now;
-            sendStatus();
-        } else if (now - lastTelemetry >= TELEMETRY_PERIOD_S * 1000UL) {
-            lastTelemetry = now;
-            sendTelemetry();
-        }
+    if (now - lastTelemetry >= TELEMETRY_PERIOD_S * 1000UL) {  // sampled into the log, link or no link
+        lastTelemetry = now;
+        sendTelemetry();
     }
+    if (radioOk && !lora.pending() && (statusDue || now - lastStatus >= STATUS_PERIOD_S * 1000UL)) {
+        statusDue = false;
+        lastStatus = now;
+        sendStatus();
+    }
+    pumpOutbox();
 
     if (const char* line = console.poll()) handleLine(line);
     delay(5);
