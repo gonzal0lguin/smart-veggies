@@ -1,0 +1,67 @@
+# smart-veggies server stack (Raspberry Pi 4, 64-bit OS, booting from SSD).
+#   cp .env.example .env   # edit passwords
+#   see README.md for the one-time Mosquitto password step, then:
+#   docker compose up -d
+services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports: ["1883:1883"]
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./mosquitto/passwd:/mosquitto/config/passwd
+      - mosquitto-data:/mosquitto/data
+
+  homeassistant:
+    image: ghcr.io/home-assistant/home-assistant:stable
+    restart: unless-stopped
+    network_mode: host            # UI on :8123; reaches the broker at 127.0.0.1:1883
+    volumes:
+      - ha-config:/config
+      - /etc/localtime:/etc/localtime:ro
+    depends_on: [mosquitto]
+
+  influxdb:
+    image: influxdb:2
+    restart: unless-stopped
+    ports: ["8086:8086"]
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_USER}
+      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUX_PASSWORD}
+      DOCKER_INFLUXDB_INIT_ORG: garden
+      DOCKER_INFLUXDB_INIT_BUCKET: garden
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUX_TOKEN}
+    volumes:
+      - influx-data:/var/lib/influxdb2
+
+  grafana:
+    image: grafana/grafana-oss:latest
+    restart: unless-stopped
+    ports: ["3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD}
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on: [influxdb]
+
+  garden-brain:
+    build: ./garden-brain
+    restart: unless-stopped
+    ports: ["8080:8080"]          # garden map: http://<pi>:8080
+    environment:
+      MQTT_HOST: mosquitto
+      MQTT_USER: ${MQTT_USER}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      INFLUX_URL: http://influxdb:8086
+      INFLUX_TOKEN: ${INFLUX_TOKEN}
+      TZ: ${TZ}
+    volumes:
+      - ./garden.yaml:/app/garden.yaml:ro
+    depends_on: [mosquitto, influxdb]
+
+volumes:
+  mosquitto-data:
+  ha-config:
+  influx-data:
+  grafana-data:

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Garden map</title>
+<style>
+  :root { --bg:#f4f1ea; --fg:#22302a; --muted:#6b756f; --card:#fff; --line:#cfd6cf; --warn:#b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#141a17; --fg:#e6ebe7; --muted:#93a099; --card:#1d2622; --line:#33403a; --warn:#ff8a80; } }
+  body { margin:0; padding:16px; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui, sans-serif; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin-bottom:12px; }
+  .chips span { display:inline-block; padding:2px 10px; margin:0 6px 6px 0; border:1px solid var(--line); border-radius:12px; background:var(--card); }
+  .chips .warn { color:var(--warn); border-color:var(--warn); font-weight:600; }
+  svg { width:100%; max-width:820px; height:auto; display:block; background:var(--card); border:1px solid var(--line); border-radius:8px; }
+  svg text { fill:#14201a; font-family:system-ui, sans-serif; }
+  .legend { display:flex; align-items:center; gap:8px; color:var(--muted); margin:8px 0 16px; font-size:13px; }
+  .legend i { display:inline-block; width:160px; height:10px; border-radius:5px; background:linear-gradient(90deg,#d9b36c,#9ccc8b,#4f9fd6); }
+  table { border-collapse:collapse; width:100%; max-width:820px; }
+  td, th { text-align:left; padding:4px 8px; border-bottom:1px solid var(--line); font-size:14px; }
+</style>
+</head>
+<body>
+<h1 id="site">Garden</h1>
+<div class="sub" id="age">loading…</div>
+<div class="chips" id="chips"></div>
+<svg id="map" viewBox="0 0 100 60"></svg>
+<div class="legend">dry <i></i> wet · zone colour = mean soil moisture, dots = individual sensors</div>
+<table id="events"></table>
+<script>
+const NS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, text) {
+  const e = document.createElementNS(NS, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (text !== undefined) e.textContent = text;
+  return e;
+}
+// dry (sand) -> ok (green) -> wet (blue)
+function colour(pct) {
+  if (pct === null || pct === undefined) return "#c9cdc9";
+  const stops = [[0, [217,179,108]], [50, [156,204,139]], [100, [79,159,214]]];
+  const p = Math.max(0, Math.min(100, pct));
+  const [a, b] = p <= 50 ? [stops[0], stops[1]] : [stops[1], stops[2]];
+  const t = (p - a[0]) / (b[0] - a[0]);
+  return "rgb(" + a[1].map((c, i) => Math.round(c + (b[1][i] - c) * t)).join(",") + ")";
+}
+function fmt(v, unit, digits = 0) { return v === null || v === undefined ? "n/a" : Number(v).toFixed(digits) + unit; }
+
+function draw(s) {
+  document.getElementById("site").textContent = s.site;
+  document.getElementById("age").textContent = s.age_s === null ? "no data from the node yet" : "last data " + s.age_s + " s ago";
+  const chips = [["air " + fmt(s.air_temp, " °C", 1) + " / " + fmt(s.air_rh, " %")]];
+  if (s.auto !== undefined && s.auto !== null) chips.push([s.auto ? "schedules on" : "schedules OFF", !s.auto]);
+  if (s.leak) chips.push(["LEAK ALARM", true]);
+  if (s.rain_skip) chips.push(["rain skip active"]);
+  if (s.sim) chips.push(["simulated sensors"]);
+  if (s.forecast) chips.push(["rain next 24 h: " + s.forecast.rain_24h_mm + " mm"]);
+  if (s.recommendation && s.recommendation.action !== "none") chips.push(["suggestion: " + s.recommendation.action]);
+  const c = document.getElementById("chips");
+  c.replaceChildren(...chips.map(([t, warn]) => { const e = document.createElement("span"); e.textContent = t; if (warn) e.className = "warn"; return e; }));
+
+  const svg = document.getElementById("map");
+  svg.replaceChildren();
+  const K = 100, pad = 30;  // px per metre
+  let w = 0, h = 0;
+  for (const b of s.beds) { w = Math.max(w, b.position_m[0] + b.size_m[0]); h = Math.max(h, b.position_m[1] + b.size_m[1]); }
+  svg.setAttribute("viewBox", `0 0 ${w * K + 2 * pad} ${h * K + 2 * pad}`);
+  for (const b of s.beds) {
+    const x0 = pad + b.position_m[0] * K, y0 = pad + b.position_m[1] * K, bw = b.size_m[0] * K, bh = b.size_m[1] * K;
+    const zw = bw / Math.max(1, b.zones.length);
+    b.zones.forEach((z, i) => {
+      const x = x0 + i * zw;
+      const fault = z.fault && z.fault !== "none";
+      const g = el("g", {});
+      g.append(el("rect", { x, y: y0, width: zw, height: bh, fill: colour(z.moisture), stroke: fault ? "#b3261e" : "#5b6b62", "stroke-width": fault ? 4 : 1.5 }));
+      g.append(el("title", {}, `Zone ${z.zone} (${z.name}) · design flow ${z.nominal_lpm} L/min`));
+      g.append(el("text", { x: x + 8, y: y0 + 20, "font-size": 14, "font-weight": 600 }, `Zone ${z.zone} · ${fmt(z.moisture, " %")}`));
+      const crops = z.plantings.map(p => `${p.count ? p.count + "× " : ""}${p.crop}`).join(", ") || "empty";
+      g.append(el("text", { x: x + 8, y: y0 + 38, "font-size": 12 }, crops));
+      g.append(el("text", { x: x + 8, y: y0 + bh - 26, "font-size": 12 }, `today ${fmt(z.today_l, " L", 1)}`));
+      g.append(el("text", { x: x + 8, y: y0 + bh - 10, "font-size": 12, "font-weight": z.state === "idle" ? 400 : 700 },
+        fault ? "FAULT: " + z.fault : z.state));
+      z.sensors.forEach((sn, k) => {
+        const cx = x + zw * (k + 1) / (z.sensors.length + 1), cy = y0 + bh * 0.55;
+        g.append(el("circle", { cx, cy, r: 11, fill: colour(sn.moisture), stroke: "#14201a", "stroke-width": 1 }));
+        g.append(el("text", { x: cx, y: cy + 4, "font-size": 10, "text-anchor": "middle" }, sn.moisture === null ? "?" : Math.round(sn.moisture)));
+      });
+      svg.append(g);
+    });
+    const label = el("text", { x: x0, y: y0 - 8, "font-size": 13 }, b.name + (b.soil_temp !== null ? ` · soil ${fmt(b.soil_temp, " °C", 1)}` : ""));
+    label.setAttribute("style", "fill: var(--fg)");
+    svg.append(label);
+  }
+
+  const rows = s.events.map(e => {
+    const tr = document.createElement("tr");
+    const cells = [new Date(e.t * 1000).toLocaleString(), e.event, e.zone ? "zone " + e.zone : "", e.litres !== undefined ? e.litres.toFixed(1) + " L" : "", e.detail || ""];
+    cells.forEach(t => { const td = document.createElement("td"); td.textContent = t; tr.append(td); });
+    return tr;
+  });
+  document.getElementById("events").replaceChildren(...rows);
+}
+async function refresh() {
+  try { draw(await (await fetch("api/state")).json()); }
+  catch (e) { document.getElementById("age").textContent = "cannot reach garden-brain"; }
+}
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>

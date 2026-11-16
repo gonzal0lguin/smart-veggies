@@ -1,0 +1,55 @@
+# The garden, described once. Used by garden-brain for the map, for tagging
+# logged data (which sensor is in which bed) and later for the water budget.
+# Zones and sensors use the same 1-based numbers as the node and the gateway.
+site:
+  name: Nursery
+  latitude: null      # fill in to enable the weather forecast (sent only to Open-Meteo)
+  longitude: null
+node: node1
+
+beds:
+  - id: bed1
+    name: Bed 1
+    position_m: [0.0, 0.0]     # top-left corner on the map
+    size_m: [2.4, 1.2]
+    soil_temp: 1               # DS18B20 number, or null
+    zones:
+      - zone: 1
+        name: left half
+        emitters: 15
+        emitter_lph: 2.0
+        soil_sensors: [1, 2]
+        plantings:
+          - {crop: tomato, variety: "", count: 6, planted: 2026-11-01}
+      - zone: 2
+        name: right half
+        emitters: 15
+        emitter_lph: 2.0
+        soil_sensors: [3, 4]
+        plantings:
+          - {crop: lettuce, variety: "", count: 12, planted: 2026-11-01}
+  - id: bed2
+    name: Bed 2
+    position_m: [0.0, 1.8]
+    size_m: [2.4, 1.2]
+    soil_temp: 2
+    zones:
+      - {zone: 3, name: left half, emitters: 15, emitter_lph: 2.0, soil_sensors: [5, 6], plantings: []}
+      - {zone: 4, name: right half, emitters: 15, emitter_lph: 2.0, soil_sensors: [7, 8], plantings: []}
+  - id: bed3
+    name: Bed 3
+    position_m: [0.0, 3.6]
+    size_m: [2.4, 1.2]
+    soil_temp: null
+    zones:
+      - {zone: 5, name: left half, emitters: 15, emitter_lph: 2.0, soil_sensors: [9], plantings: []}
+      - {zone: 6, name: right half, emitters: 15, emitter_lph: 2.0, soil_sensors: [10], plantings: []}
+
+# Crop coefficients (initial / mid / late season) for the water budget (Phase 5).
+crops:
+  tomato: {kc: [0.6, 1.15, 0.8]}
+  lettuce: {kc: [0.7, 1.0, 0.95]}
+
+rules:
+  rain_skip_mm: 5.0        # forecast rain in the next 24 h that suggests skipping
+  auto_apply: false        # false = only publish recommendations
