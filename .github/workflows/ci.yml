@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Firmware logic (host unit tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-native-${{ hashFiles('firmware/platformio.ini') }}
+      - run: pip install platformio
+      # protocol, message signing, irrigation state machine, scheduler, calendar/RTC maths
+      - run: pio test -e native
+        working-directory: firmware
+
+  firmware-build:
+    name: Firmware builds (ESP32)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.platformio
+          key: pio-esp32-${{ hashFiles('firmware/platformio.ini') }}
+      - run: pip install platformio
+      # the gateway needs a secrets.h; the example one is enough to compile
+      - run: cp include/secrets.example.h include/secrets.h
+        working-directory: firmware
+      # 5 bring-up firmwares + node + node-sim + gateway
+      - run: ./scripts/test.sh build-all
+        working-directory: firmware
+
+  server:
+    name: Server (fake node, MQTT, garden-brain)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r server/garden-brain/requirements.txt
+      - name: Compose file is valid
+        run: cp .env.example .env && docker compose config -q
+        working-directory: server
+      - name: Start a throwaway MQTT broker
+        run: |
+          docker run -d --name mqtt -p 1883:1883 eclipse-mosquitto:2 \
+            sh -c 'printf "listener 1883\nallow_anonymous true\n" > /tmp/m.conf && mosquitto -c /tmp/m.conf'
+          sleep 3
+      - name: End-to-end smoke test
+        run: python3 tests/smoke_test.py
+        working-directory: server

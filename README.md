@@ -22,8 +22,21 @@ server/     docker compose stack, garden-brain service (logging, garden map, for
 cd firmware
 ./scripts/test.sh build-all          # compile every bring-up firmware
 ./scripts/test.sh lora_range         # flash + monitor one of: lora_range soil flow valves climate
-pio test -e native                   # unit tests on the PC: protocol, messages/auth, irrigation, scheduler
+pio test -e native                   # unit tests on the PC: protocol, messages/auth, irrigation, scheduler, clock maths
 pio run -e node-sim -t upload -t monitor   # whole node on a bare ESP32 with simulated sensors
 pio run -e node -t upload -t monitor       # real node
 pio run -e gateway -t upload -t monitor    # LoRa <-> MQTT bridge (needs include/secrets.h)
 ```
+
+## Automated checks
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every push and pull request:
+
+| Job | What it proves |
+|---|---|
+| Firmware logic | host unit tests (`pio test -e native`) |
+| Firmware builds | every bring-up firmware, `node`, `node-sim` and `gateway` compile for the ESP32 |
+| Server | compose file is valid; `server/tests/smoke_test.py` runs a broker, the fake node and garden-brain and checks a watering command end to end |
+
+Hardware behaviour (radio, sensors, valves) cannot be checked there; that is what
+the checklists in `docs/` are for.
